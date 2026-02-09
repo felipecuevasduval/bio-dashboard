@@ -1,21 +1,26 @@
-﻿function base64UrlEncode(arrayBuffer) {
-  const bytes = new Uint8Array(arrayBuffer);
-  let str = "";
-  for (const b of bytes) str += String.fromCharCode(b);
-  return btoa(str).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+﻿// src/auth/pkce.js
+
+function base64UrlEncode(arr) {
+  return btoa(String.fromCharCode(...new Uint8Array(arr)))
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/, "");
 }
 
-function randomString(len = 64) {
-  const charset = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~";
+export function randomString(len = 64) {
   const bytes = new Uint8Array(len);
   crypto.getRandomValues(bytes);
-  return Array.from(bytes, (b) => charset[b % charset.length]).join("");
+  // convierte a texto seguro
+  return base64UrlEncode(bytes).slice(0, len);
 }
 
-export async function createPkcePair() {
-  const verifier = randomString(64);
-  const data = new TextEncoder().encode(verifier);
-  const digest = await crypto.subtle.digest("SHA-256", data);
-  const challenge = base64UrlEncode(digest);
-  return { verifier, challenge };
+export async function sha256(input) {
+  const data = new TextEncoder().encode(input);
+  const hash = await crypto.subtle.digest("SHA-256", data);
+  return new Uint8Array(hash);
+}
+
+export async function pkceChallengeFromVerifier(verifier) {
+  const hashed = await sha256(verifier);
+  return base64UrlEncode(hashed);
 }

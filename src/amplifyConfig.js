@@ -1,21 +1,19 @@
-export const amplifyConfig = {
-  Auth: {
-    Cognito: {
-      userPoolId: "eu-south-2_wLj1GlAv4",
-      userPoolClientId: "121jl2ivp6arcq6pq7ju0f8d1r",
-      loginWith: {
-        oauth: {
-          domain: "eu-south-2wlj1glav4.auth.eu-south-2.amazoncognito.com",
-          scopes: ["openid", "email", "profile"],
-          redirectSignIn: [
-            "http://localhost:5173/",
-          ],
-          redirectSignOut: [
-            "http://localhost:5173/",
-          ],
-          responseType: "code",
-        },
-      },
-    },
-  },
+// src/amplifyConfig.js
+export const config = {
+  region: "eu-south-2",
+
+  // Cognito
+  userPoolId: "eu-south-2_wLj1GlAv4",
+  clientId: "121jl2ivp6arcq6pq7ju0f8d1r",
+  cognitoDomain: "https://eu-south-2wlj1glav4.auth.eu-south-2.amazoncognito.com",
+
+  // OJO: usa SOLO scopes permitidos en el App Client
+  scopes: ["openid", "email"],
+
+  // Redirects
+  redirectUriDev: "http://localhost:5173/",
+  redirectUriProd: "https://main.dopckgtccvn0w.amplifyapp.com/",
+
+  // API Gateway
+  apiBaseUrl: "https://mnd77hcxpc.execute-api.eu-south-2.amazonaws.com",
 };
