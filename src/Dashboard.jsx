@@ -1,343 +1,294 @@
-// src/Dashboard.jsx
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import { fetchAuthSession } from "aws-amplify/auth";
 import {
   LineChart,
   Line,
   XAxis,
   YAxis,
-  CartesianGrid,
   Tooltip,
   ResponsiveContainer,
+  CartesianGrid,
 } from "recharts";
-import { config } from "./amplifyConfig.js";
+import { apiGet, apiPut } from "./api.js";
 
-function parseJwtPayload(token) {
+const CHUNK_MS = 500;   // ESP mandará bloques cada 500ms
+const WINDOW_MS = 60_000; // últimos 60s
+const POLL_MS = 1000;     // refresco dashboard
+
+function decodeJwtPayload(token) {
   try {
-    const payload = token.split(".")[1];
-    const base64 = payload.replace(/-/g, "+").replace(/_/g, "/");
-    const padded = base64.padEnd(base64.length + ((4 - (base64.length % 4)) % 4), "=");
+    const payload = token.split(".")[1].replace(/-/g, "+").replace(/_/g, "/");
+    const padded = payload + "===".slice((payload.length + 3) % 4);
     return JSON.parse(atob(padded));
   } catch {
     return {};
   }
 }
 
-async function getAccessToken() {
-  const session = await fetchAuthSession();
-  const token = session?.tokens?.accessToken?.toString();
-  if (!token) throw new Error("No access token");
-  return token;
-}
-
-async function apiGet(path) {
-  const token = await getAccessToken();
-  const res = await fetch(`${config.apiBaseUrl}${path}`, {
-    headers: { Authorization: `Bearer ${token}` },
-  });
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data?.error || data?.message || "Request failed");
-  return data;
-}
-
-async function apiPut(path, body) {
-  const token = await getAccessToken();
-  const res = await fetch(`${config.apiBaseUrl}${path}`, {
-    method: "PUT",
-    headers: {
-      Authorization: `Bearer ${token}`,
-      "content-type": "application/json",
-    },
-    body: JSON.stringify(body),
-  });
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data?.error || data?.message || "Request failed");
-  return data;
-}
-
-function formatTs(ms) {
-  const d = new Date(ms);
-  return d.toLocaleTimeString();
-}
-
 export default function Dashboard({ user, signOut }) {
-  const [devices, setDevices] = useState([]);
-  const [selectedDeviceId, setSelectedDeviceId] = useState("");
-  const [patientId, setPatientId] = useState("");
-  const [saving, setSaving] = useState(false);
-
-  const [hrSeries, setHrSeries] = useState([]);
-  const [edaSeries, setEdaSeries] = useState([]);
-  const [kpis, setKpis] = useState({ hr: null, eda: null, lastTs: null });
-
-  const [status, setStatus] = useState({ loading: true, err: "" });
-  const timerRef = useRef(null);
-
+  const [token, setToken] = useState("");
   const [isAdmin, setIsAdmin] = useState(false);
 
-  // Detect admin from token claims (cognito:groups)
-  useEffect(() => {
-    (async () => {
-      try {
-        const token = await getAccessToken();
-        const claims = parseJwtPayload(token);
-        const groups = claims["cognito:groups"];
-        const arr = Array.isArray(groups)
-          ? groups
-          : typeof groups === "string"
-          ? groups.split(",").map((s) => s.trim())
-          : [];
-        setIsAdmin(arr.includes("admin"));
-      } catch {
-        setIsAdmin(false);
-      }
-    })();
-  }, []);
+  const [devices, setDevices] = useState([]);
+  const [selectedDevice, setSelectedDevice] = useState("");
 
-  // Load devices
+  const [patientIdInput, setPatientIdInput] = useState("");
+  const [status, setStatus] = useState("");
+  const [items, setItems] = useState([]);
+
+  // 1) token + groups
   useEffect(() => {
+    let mounted = true;
     (async () => {
       try {
-        setStatus({ loading: true, err: "" });
-        const data = await apiGet("/devices");
-        const list = data?.items || [];
-        setDevices(list);
-        const first = list?.[0]?.device_id || "";
-        setSelectedDeviceId(first);
-        setPatientId(list?.[0]?.patient_id || "");
-        setStatus({ loading: false, err: "" });
+        const sess = await fetchAuthSession();
+        const t = sess.tokens?.accessToken?.toString?.() || "";
+        if (!mounted) return;
+        setToken(t);
+
+        const payload = decodeJwtPayload(t);
+        const groups = payload["cognito:groups"];
+        const admin =
+          Array.isArray(groups) ? groups.includes("admin") :
+          typeof groups === "string" ? groups.split(",").map(s => s.trim()).includes("admin") :
+          false;
+        setIsAdmin(admin);
       } catch (e) {
-        setStatus({ loading: false, err: String(e.message || e) });
+        setStatus(`Auth error: ${String(e)}`);
       }
     })();
+    return () => { mounted = false; };
   }, []);
 
-  // When selecting device, update patientId field and start polling
+  // 2) load devices al iniciar
   useEffect(() => {
-    const dev = devices.find((d) => d.device_id === selectedDeviceId);
-    setPatientId(dev?.patient_id || "");
+    if (!token) return;
+    let mounted = true;
 
-    if (!selectedDeviceId) return;
+    (async () => {
+      try {
+        const data = await apiGet("/devices", token);
+        if (!mounted) return;
 
-    const poll = async () => {
+        const list = data.items || [];
+        setDevices(list);
+
+        const first = list?.[0]?.device_id || "";
+        setSelectedDevice(first);
+        setPatientIdInput(list?.[0]?.patient_id || "");
+      } catch (e) {
+        setStatus(`Error loading devices: ${String(e)}`);
+      }
+    })();
+
+    return () => { mounted = false; };
+  }, [token]);
+
+  // device actual
+  const selectedDeviceObj = useMemo(() => {
+    return devices.find((d) => d.device_id === selectedDevice) || null;
+  }, [devices, selectedDevice]);
+
+  // 3) polling measurements
+  useEffect(() => {
+    if (!token || !selectedDevice) return;
+
+    let timer = null;
+    let stopped = false;
+
+    const tick = async () => {
       try {
         const now = Date.now();
-        const from = now - 60_000; // last 60s
-        const limit = 500; // con 200ms -> ~300 puntos/min
-        const data = await apiGet(
-          `/measurements?device_id=${encodeURIComponent(selectedDeviceId)}&from=${from}&to=${now}&limit=${limit}`
-        );
+        const from = now - WINDOW_MS;
 
-        const items = Array.isArray(data?.items) ? data.items : [];
-        // Normaliza
-        const series = items
-          .map((x) => ({
-            ts: Number(x.ts),
-            hr: Number(x.hr ?? 0),
-            eda: Number(x.eda ?? 0),
-          }))
-          .filter((x) => Number.isFinite(x.ts))
-          .sort((a, b) => a.ts - b.ts);
+        const q = `/measurements?device_id=${encodeURIComponent(selectedDevice)}&from=${from}&to=${now}&limit=800`;
+        const data = await apiGet(q, token);
+        if (stopped) return;
 
-        const hr = series.map((p) => ({ t: p.ts, v: p.hr }));
-        const eda = series.map((p) => ({ t: p.ts, v: p.eda }));
-
-        setHrSeries(
-          hr.map((p) => ({ time: formatTs(p.t), value: p.v }))
-        );
-        setEdaSeries(
-          eda.map((p) => ({ time: formatTs(p.t), value: p.v }))
-        );
-
-        const last = series[series.length - 1];
-        setKpis({
-          hr: last ? last.hr : null,
-          eda: last ? last.eda : null,
-          lastTs: last ? last.ts : null,
-        });
-        setStatus((s) => ({ ...s, err: "" }));
+        setItems(data.items || []);
+        setStatus("");
       } catch (e) {
-        setStatus((s) => ({ ...s, err: String(e.message || e) }));
+        setStatus(`Error loading measurements: ${String(e)}`);
       }
     };
 
-    poll();
-    timerRef.current && clearInterval(timerRef.current);
-    timerRef.current = setInterval(poll, 2000);
+    tick();
+    timer = setInterval(tick, POLL_MS);
 
     return () => {
-      timerRef.current && clearInterval(timerRef.current);
+      stopped = true;
+      if (timer) clearInterval(timer);
     };
-  }, [selectedDeviceId, devices]);
+  }, [token, selectedDevice]);
 
-  const selectedDevice = useMemo(
-    () => devices.find((d) => d.device_id === selectedDeviceId),
-    [devices, selectedDeviceId]
-  );
+  // 4) EDA series (simple)
+  const edaSeries = useMemo(() => {
+    return (items || []).map((it) => ({
+      t: it.ts,
+      eda: Number(it.eda || 0),
+    }));
+  }, [items]);
+
+  // 5) HR display
+  const latestHr = useMemo(() => {
+    if (!items?.length) return 0;
+    return Number(items[items.length - 1]?.hr || 0);
+  }, [items]);
+
+  // 6) ECG flatten: cada item trae ecg[] de N muestras
+  const ecgSeries = useMemo(() => {
+    const pts = [];
+    for (const it of items || []) {
+      const arr = Array.isArray(it.ecg) ? it.ecg : [];
+      const n = arr.length;
+      if (n === 0) continue;
+
+      const endTs = Number(it.ts);
+      const startTs = endTs - CHUNK_MS;
+      const dt = CHUNK_MS / n;
+
+      for (let i = 0; i < n; i++) {
+        pts.push({
+          t: Math.round(startTs + i * dt),
+          ecg: Number(arr[i] || 0),
+        });
+      }
+    }
+
+    // recorta a ventana
+    const cutoff = Date.now() - WINDOW_MS;
+    return pts.filter((p) => p.t >= cutoff);
+  }, [items]);
+
+  const onChangeDevice = (e) => {
+    const dev = e.target.value;
+    setSelectedDevice(dev);
+    const obj = devices.find((d) => d.device_id === dev);
+    setPatientIdInput(obj?.patient_id || "");
+    setItems([]);
+    setStatus("");
+  };
 
   const onSavePatientId = async () => {
-    if (!selectedDeviceId) return;
-    if (!patientId.trim()) return;
+    if (!isAdmin) return;
+    if (!selectedDevice) return;
+    const pid = (patientIdInput || "").trim();
+    if (!pid) {
+      setStatus("patient_id requerido");
+      return;
+    }
 
     try {
-      setSaving(true);
-      await apiPut(`/devices/${encodeURIComponent(selectedDeviceId)}`, {
-        patient_id: patientId.trim(),
-      });
-
-      // update local list
-      setDevices((prev) =>
-        prev.map((d) =>
-          d.device_id === selectedDeviceId ? { ...d, patient_id: patientId.trim() } : d
-        )
-      );
+      await apiPut(`/devices/${encodeURIComponent(selectedDevice)}`, token, { patient_id: pid });
+      // refresca lista devices (para ver el cambio)
+      const data = await apiGet("/devices", token);
+      setDevices(data.items || []);
+      setStatus("✅ patient_id actualizado");
     } catch (e) {
-      setStatus((s) => ({ ...s, err: String(e.message || e) }));
-    } finally {
-      setSaving(false);
+      setStatus(`Error updating patient_id: ${String(e)}`);
     }
   };
 
-  if (status.loading) {
-    return (
-      <div className="page">
-        <div className="container">
-          <div className="card">Cargando...</div>
-        </div>
-      </div>
-    );
-  }
+  const email = user?.signInDetails?.loginId || user?.username || "user";
 
   return (
     <div className="page">
-      <div className="container">
-        <header className="topbar">
-          <div>
-            <h1>Bio Dashboard</h1>
-            <div className="muted">
-              API: {config.apiBaseUrl}
-              {kpis.lastTs ? ` · last: ${new Date(kpis.lastTs).toLocaleString()}` : ""}
-            </div>
+      <div className="topbar">
+        <div>
+          <div className="title">Bio Dashboard</div>
+          <div className="sub">
+            {email} {isAdmin ? "(admin)" : "(viewer)"}
           </div>
+        </div>
+        <button className="btn" onClick={signOut}>Sign out</button>
+      </div>
 
-          <div className="topbarRight">
-            <div className="pill">
-              {user?.username ? `@${user.username}` : "signed"}
-              {isAdmin ? " · admin" : " · viewer"}
-            </div>
-            <button className="btn" onClick={signOut}>
-              Sign out
-            </button>
+      <div className="sep" />
+
+      <div className="controlBar">
+        <div className="field">
+          <div className="label">Device</div>
+          <select value={selectedDevice} onChange={onChangeDevice}>
+            {devices.map((d) => (
+              <option key={d.device_id} value={d.device_id}>
+                {d.device_id}
+              </option>
+            ))}
+          </select>
+          <div className="tiny">
+            patient_id: <b>{selectedDeviceObj?.patient_id || "-"}</b>
           </div>
-        </header>
-
-        {status.err ? <div className="alert">⚠️ {status.err}</div> : null}
-
-        <div className="grid">
-          {/* Left: Devices */}
-          <section className="card">
-            <h2>Devices</h2>
-
-            <label className="label">Select device</label>
-            <select
-              className="select"
-              value={selectedDeviceId}
-              onChange={(e) => setSelectedDeviceId(e.target.value)}
-            >
-              {devices.map((d) => (
-                <option key={d.device_id} value={d.device_id}>
-                  {d.device_id}
-                </option>
-              ))}
-            </select>
-
-            <div className="kv">
-              <div className="k">thing_name</div>
-              <div className="v">{selectedDevice?.thing_name || "-"}</div>
-
-              <div className="k">patient_id</div>
-              <div className="v">{selectedDevice?.patient_id || "-"}</div>
-            </div>
-
-            <hr className="sep" />
-
-            <h3>Admin: set patient_id</h3>
-            <div className="muted small">
-              Solo admin puede guardar (PUT /devices/:id)
-            </div>
-
-            <input
-              className="input"
-              placeholder="e.g. PACIENTE_001"
-              value={patientId}
-              disabled={!isAdmin}
-              onChange={(e) => setPatientId(e.target.value)}
-            />
-
-            <button
-              className="btnPrimary"
-              disabled={!isAdmin || saving || !patientId.trim()}
-              onClick={onSavePatientId}
-            >
-              {saving ? "Saving..." : "Save patient_id"}
-            </button>
-          </section>
-
-          {/* Right: Charts */}
-          <section className="card">
-            <div className="cardHeader">
-              <div>
-                <h2>Live data</h2>
-                <div className="muted small">Last 60s · polling 2s</div>
-              </div>
-
-              <div className="kpis">
-                <div className="kpi">
-                  <div className="kpiLabel">HR (bpm)</div>
-                  <div className="kpiValue">{kpis.hr ?? "—"}</div>
-                </div>
-                <div className="kpi">
-                  <div className="kpiLabel">EDA</div>
-                  <div className="kpiValue">{kpis.eda ?? "—"}</div>
-                </div>
-              </div>
-            </div>
-
-            <div className="chartBlock">
-              <div className="chartTitle">HR</div>
-              <div className="chart">
-                <ResponsiveContainer width="100%" height={260}>
-                  <LineChart data={hrSeries}>
-                    <CartesianGrid strokeDasharray="3 3" />
-                    <XAxis dataKey="time" tickMargin={8} />
-                    <YAxis tickMargin={8} />
-                    <Tooltip />
-                    <Line type="monotone" dataKey="value" dot={false} />
-                  </LineChart>
-                </ResponsiveContainer>
-              </div>
-            </div>
-
-            <div className="chartBlock">
-              <div className="chartTitle">EDA</div>
-              <div className="chart">
-                <ResponsiveContainer width="100%" height={260}>
-                  <LineChart data={edaSeries}>
-                    <CartesianGrid strokeDasharray="3 3" />
-                    <XAxis dataKey="time" tickMargin={8} />
-                    <YAxis tickMargin={8} />
-                    <Tooltip />
-                    <Line type="monotone" dataKey="value" dot={false} />
-                  </LineChart>
-                </ResponsiveContainer>
-              </div>
-            </div>
-          </section>
         </div>
 
-        <footer className="footer muted small">
-          Tip: si no ves data, confirma que tu IoT Rule está metiendo ts en ms y que el endpoint /measurements devuelve items.
-        </footer>
+        <div className="field">
+          <div className="label">HR</div>
+          <div className="kpi">{latestHr.toFixed(0)} bpm</div>
+          <div className="tiny">Actualiza cada {POLL_MS}ms</div>
+        </div>
+
+        <div className="field">
+          <div className="label">Admin</div>
+          <input
+            placeholder="patient_id (ej: PACIENTE_001)"
+            value={patientIdInput}
+            onChange={(e) => setPatientIdInput(e.target.value)}
+            disabled={!isAdmin}
+          />
+          <button className="btnPrimary" disabled={!isAdmin} onClick={onSavePatientId}>
+            Save patient_id
+          </button>
+          {!isAdmin && <div className="tiny">Solo admin puede editar</div>}
+        </div>
+      </div>
+
+      {status ? <div className="status">{status}</div> : null}
+
+      <div className="grid">
+        <div className="card">
+          <div className="cardTitle">EDA (últimos 60s)</div>
+          <div className="chart">
+            <ResponsiveContainer width="100%" height={260}>
+              <LineChart data={edaSeries}>
+                <CartesianGrid strokeDasharray="3 3" />
+                <XAxis
+                  dataKey="t"
+                  tickFormatter={(v) => new Date(v).toLocaleTimeString()}
+                  minTickGap={30}
+                />
+                <YAxis />
+                <Tooltip
+                  labelFormatter={(v) => new Date(v).toLocaleTimeString()}
+                />
+                <Line type="monotone" dataKey="eda" dot={false} />
+              </LineChart>
+            </ResponsiveContainer>
+          </div>
+          <div className="hint">EDA llega a 1Hz o como tú la publiques. El dashboard no asume frecuencia fija.</div>
+        </div>
+
+        <div className="card">
+          <div className="cardTitle">ECG (reconstruido desde chunks)</div>
+          <div className="chart">
+            <ResponsiveContainer width="100%" height={260}>
+              <LineChart data={ecgSeries}>
+                <CartesianGrid strokeDasharray="3 3" />
+                <XAxis
+                  dataKey="t"
+                  tickFormatter={(v) => new Date(v).toLocaleTimeString()}
+                  minTickGap={30}
+                />
+                <YAxis />
+                <Tooltip
+                  labelFormatter={(v) => new Date(v).toLocaleTimeString()}
+                />
+                <Line type="linear" dataKey="ecg" dot={false} />
+              </LineChart>
+            </ResponsiveContainer>
+          </div>
+          <div className="hint">
+            ECG asume chunk = {CHUNK_MS}ms. Si envías 125 muestras ⇒ 250Hz. Si envías 500, también funciona (dt=chunk/N).
+          </div>
+        </div>
       </div>
     </div>
   );

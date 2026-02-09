@@ -1,17 +1,17 @@
-// src/App.jsx
 import React from "react";
-import { Authenticator, View } from "@aws-amplify/ui-react";
+import { Authenticator } from "@aws-amplify/ui-react";
+import "@aws-amplify/ui-react/styles.css";
 import Dashboard from "./Dashboard.jsx";
 import "./App.css";
 
 export default function App() {
   return (
-    <View className="appShell">
+    <div className="appShell">
       <Authenticator hideSignUp>
-        {({ signOut, user }) => (
+        {({ user, signOut }) => (
           <Dashboard user={user} signOut={signOut} />
         )}
       </Authenticator>
-    </View>
+    </div>
   );
 }

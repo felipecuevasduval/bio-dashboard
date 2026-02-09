@@ -1,4 +1,4 @@
-﻿import { config } from "./amplifyConfig";
+﻿import { config } from "./amplifyConfig.js";
 
 export async function apiGet(path, token) {
   const res = await fetch(`${config.apiBaseUrl}${path}`, {
