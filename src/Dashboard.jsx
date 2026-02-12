@@ -213,7 +213,7 @@ export default function Dashboard({ user, signOut }) {
     (async () => {
       try {
         const sess = await fetchAuthSession();
-        const t = sess.tokens?.accessToken?.toString?.() || "";
+        const t = sess.tokens?.idToken?.toString?.() || sess.tokens?.accessToken?.toString?.() || "";
         if (!mounted) return;
 
         setToken(t);
