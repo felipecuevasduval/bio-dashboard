@@ -14,8 +14,10 @@ import { config } from "./amplifyConfig.js";
 const API = config.apiBaseUrl; // sin slash final
 
 const CHUNK_MS = 500;        // ESP manda un chunk cada 500ms
-const WINDOW_MS = 60_000;    // últimos 60s
-const POLL_MS = 1000;        // refresco dashboard
+const WINDOW_MS = 60_000;    // últimos 60s guardados en memoria
+const DISPLAY_MS = 5_000;    // ventana visible en el eje X (5s)
+const POLL_MS = 1000;        // refresco dashboard (1s)
+const CLOCK_MS = 250;        // refresco reloj UI
 
 function decodeJwtPayload(token) {
   try {
@@ -58,6 +60,13 @@ export default function Dashboard({ user, signOut }) {
 
   const [items, setItems] = useState([]);
   const [status, setStatus] = useState("");
+
+  // reloj actual (hora del navegador)
+  const [nowMs, setNowMs] = useState(Date.now());
+
+  // ventana visible del gráfico (control tipo timeline)
+  const [followLive, setFollowLive] = useState(true);
+  const [viewTo, setViewTo] = useState(Date.now());
 
   // ====== STYLES ======
   const pageStyle = {
@@ -120,7 +129,7 @@ export default function Dashboard({ user, signOut }) {
   };
 
   const kpiColStyle = {
-    flex: "1 1 calc(33.333% - 12px)", // ~33%
+    flex: "1 1 calc(33.333% - 12px)",
     minWidth: 260,
   };
 
@@ -134,9 +143,9 @@ export default function Dashboard({ user, signOut }) {
   };
 
   const chartColStyle = {
-    flex: "1 1 40%", // tu requerimiento
+    flex: "1 1 40%",
     minWidth: 360,
-    maxWidth: "calc(50% - 8px)", // se ve más “pro” con 2-up y gap
+    maxWidth: "calc(50% - 8px)",
   };
 
   const chartBoxStyle = {
@@ -207,13 +216,47 @@ export default function Dashboard({ user, signOut }) {
     boxShadow: "0 10px 30px rgba(0,0,0,0.10)",
   };
 
+  const timelineRowStyle = {
+    ...shellStyle,
+    marginTop: 14,
+    display: "flex",
+    gap: 12,
+    alignItems: "center",
+    flexWrap: "wrap",
+  };
+
+  const timelineCardStyle = {
+    ...cardStyle,
+    width: "100%",
+  };
+
+  const timelineControlsStyle = {
+    display: "flex",
+    alignItems: "center",
+    gap: 12,
+    flexWrap: "wrap",
+  };
+
+  const smallBtnStyle = {
+    background: "#ffffff",
+    border: "1px solid rgba(0,0,0,0.15)",
+    color: "#0b0b0b",
+    padding: "8px 12px",
+    borderRadius: 10,
+    fontWeight: 800,
+    cursor: "pointer",
+  };
+
   // 1) token + groups
   useEffect(() => {
     let mounted = true;
     (async () => {
       try {
         const sess = await fetchAuthSession();
-        const t = sess.tokens?.idToken?.toString?.() || sess.tokens?.accessToken?.toString?.() || "";
+        const t =
+          sess.tokens?.idToken?.toString?.() ||
+          sess.tokens?.accessToken?.toString?.() ||
+          "";
         if (!mounted) return;
 
         setToken(t);
@@ -224,7 +267,10 @@ export default function Dashboard({ user, signOut }) {
           Array.isArray(groups)
             ? groups.includes("admin")
             : typeof groups === "string"
-            ? groups.split(",").map((s) => s.trim()).includes("admin")
+            ? groups
+                .split(",")
+                .map((s) => s.trim())
+                .includes("admin")
             : false;
 
         setIsAdmin(admin);
@@ -235,6 +281,12 @@ export default function Dashboard({ user, signOut }) {
     return () => {
       mounted = false;
     };
+  }, []);
+
+  // reloj actual
+  useEffect(() => {
+    const t = setInterval(() => setNowMs(Date.now()), CLOCK_MS);
+    return () => clearInterval(t);
   }, []);
 
   // 2) load devices
@@ -302,14 +354,28 @@ export default function Dashboard({ user, signOut }) {
     return devices.find((d) => d.device_id === selectedDevice) || null;
   }, [devices, selectedDevice]);
 
-  const latestHr = useMemo(() => {
-    if (!items?.length) return 0;
-    return Number(items[items.length - 1]?.hr || 0);
+  const latestItem = useMemo(() => {
+    if (!items?.length) return null;
+    return items[items.length - 1] || null;
   }, [items]);
 
+  const latestHr = useMemo(() => Number(latestItem?.hr || 0), [latestItem]);
+  const latestSpo2 = useMemo(() => Number(latestItem?.spo2 || 0), [latestItem]);
+
+  const latestLeadOff = useMemo(() => {
+    const v = latestItem?.leadOff ?? latestItem?.lead_off ?? 0;
+    return Number(v || 0);
+  }, [latestItem]);
+
+  const latestTs = useMemo(() => {
+    const t = Number(latestItem?.ts || 0);
+    return Number.isFinite(t) ? t : 0;
+  }, [latestItem]);
+
+  // Series completas (hasta 60s)
   const edaSeries = useMemo(() => {
     return (items || []).map((it) => ({
-      t: it.ts,
+      t: Number(it.ts),
       eda: Number(it.eda || 0),
     }));
   }, [items]);
@@ -337,6 +403,55 @@ export default function Dashboard({ user, signOut }) {
     return pts.filter((p) => p.t >= cutoff);
   }, [items]);
 
+  // Timeline bounds (usa ECG si hay; si no, usa EDA)
+  const timelineBounds = useMemo(() => {
+    const series = ecgSeries.length ? ecgSeries : edaSeries;
+    if (!series.length) {
+      const t = Date.now();
+      return { min: t - WINDOW_MS, max: t };
+    }
+    const min = Number(series[0]?.t || Date.now() - WINDOW_MS);
+    const max = Number(series[series.length - 1]?.t || Date.now());
+    return { min, max };
+  }, [ecgSeries, edaSeries]);
+
+  // Auto-follow: si está en live, mueve la ventana al último timestamp recibido (o now)
+  useEffect(() => {
+    if (!followLive) return;
+    const anchor = latestTs || Date.now();
+    setViewTo(anchor);
+  }, [followLive, latestTs]);
+
+  const viewFrom = useMemo(() => viewTo - DISPLAY_MS, [viewTo]);
+
+  // Para mostrar slider usable: mínimo tiene que permitir una ventana de 5s
+  const sliderMin = useMemo(() => {
+    const m = timelineBounds.min + DISPLAY_MS;
+    return Number.isFinite(m) ? m : Date.now() - WINDOW_MS + DISPLAY_MS;
+  }, [timelineBounds.min]);
+
+  const sliderMax = useMemo(() => {
+    const m = timelineBounds.max;
+    return Number.isFinite(m) ? m : Date.now();
+  }, [timelineBounds.max]);
+
+  const sliderDisabled = useMemo(() => {
+    return sliderMax <= sliderMin;
+  }, [sliderMax, sliderMin]);
+
+  const clampViewTo = (v) => {
+    if (!Number.isFinite(v)) return sliderMax;
+    if (v < sliderMin) return sliderMin;
+    if (v > sliderMax) return sliderMax;
+    return v;
+  };
+
+  // Si cambia el rango de datos (entra data nueva), evita que viewTo se quede fuera de bounds
+  useEffect(() => {
+    setViewTo((prev) => clampViewTo(prev));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sliderMin, sliderMax]);
+
   const onChangeDevice = (e) => {
     const dev = e.target.value;
     setSelectedDevice(dev);
@@ -345,6 +460,8 @@ export default function Dashboard({ user, signOut }) {
     setPatientIdInput(obj?.patient_id || "");
     setItems([]);
     setStatus("");
+    setFollowLive(true);
+    setViewTo(Date.now());
   };
 
   const onSavePatientId = async () => {
@@ -364,17 +481,31 @@ export default function Dashboard({ user, signOut }) {
 
       const data = await apiGet("/devices", token);
       setDevices(data.items || []);
-      setStatus("✅ patient_id actualizado");
+      setStatus("patient_id actualizado");
     } catch (e) {
       setStatus(`Error updating patient_id: ${String(e)}`);
     }
   };
 
+  const onTimelineChange = (e) => {
+    const v = Number(e.target.value);
+    setFollowLive(false);
+    setViewTo(clampViewTo(v));
+  };
+
+  const onLive = () => {
+    setFollowLive(true);
+    const anchor = latestTs || Date.now();
+    setViewTo(clampViewTo(anchor));
+  };
+
+  const nowTimeStr = useMemo(() => new Date(nowMs).toLocaleTimeString(), [nowMs]);
+  const nowDateTimeStr = useMemo(() => new Date(nowMs).toLocaleString(), [nowMs]);
+
   const email = user?.signInDetails?.loginId || user?.username || "user";
 
   return (
     <div style={pageStyle}>
-      {/* TOPBAR 75% centrado */}
       <div style={topbarStyle}>
         <div>
           <h2 style={titleStyle}>Bio Dashboard</h2>
@@ -387,7 +518,6 @@ export default function Dashboard({ user, signOut }) {
         </button>
       </div>
 
-      {/* KPIs 3 columnas ~33% */}
       <div style={kpiRowStyle}>
         <div style={kpiColStyle}>
           <div style={cardStyle}>
@@ -413,7 +543,27 @@ export default function Dashboard({ user, signOut }) {
             <div style={{ fontSize: 44, fontWeight: 900, marginTop: 2 }}>
               {latestHr.toFixed(0)} <span style={{ fontSize: 18, fontWeight: 800 }}>bpm</span>
             </div>
-            <div style={hintStyle}>Actualiza cada {POLL_MS} ms</div>
+            <div style={hintStyle}>Actualiza cada 1s</div>
+          </div>
+        </div>
+
+        <div style={kpiColStyle}>
+          <div style={cardStyle}>
+            <h3 style={sectionTitleStyle}>SpO2</h3>
+            <div style={{ fontSize: 44, fontWeight: 900, marginTop: 2 }}>
+              {latestSpo2.toFixed(0)} <span style={{ fontSize: 18, fontWeight: 800 }}>%</span>
+            </div>
+            <div style={hintStyle}>Último valor recibido</div>
+          </div>
+        </div>
+
+        <div style={kpiColStyle}>
+          <div style={cardStyle}>
+            <h3 style={sectionTitleStyle}>Hora</h3>
+            <div style={{ fontSize: 34, fontWeight: 900, marginTop: 6 }}>
+              {nowTimeStr}
+            </div>
+            <div style={hintStyle}>{nowDateTimeStr}</div>
           </div>
         </div>
 
@@ -438,61 +588,97 @@ export default function Dashboard({ user, signOut }) {
         </div>
       </div>
 
-      {/* STATUS */}
       {status ? (
         <div style={statusStyle}>
           <b>Status:</b> {status}
         </div>
       ) : null}
 
-      {/* Charts: 2 columnas ~40% */}
       <div style={chartsRowStyle}>
         <div style={chartColStyle}>
           <div style={cardStyle}>
-            <h3 style={sectionTitleStyle}>EDA (últimos 60s)</h3>
+            <h3 style={sectionTitleStyle}>EDA</h3>
             <div style={chartBoxStyle}>
               <ResponsiveContainer width="100%" height="100%">
                 <LineChart data={edaSeries}>
                   <CartesianGrid strokeDasharray="3 3" />
                   <XAxis
                     dataKey="t"
+                    type="number"
+                    domain={[viewFrom, viewTo]}
+                    allowDataOverflow
                     tickFormatter={(v) => new Date(v).toLocaleTimeString()}
                     minTickGap={30}
                   />
                   <YAxis />
                   <Tooltip labelFormatter={(v) => new Date(v).toLocaleTimeString()} />
-                  <Line type="monotone" dataKey="eda" dot={false} />
+                  <Line type="monotone" dataKey="eda" dot={false} isAnimationActive={false} />
                 </LineChart>
               </ResponsiveContainer>
-            </div>
-            <div style={hintStyle}>
-              EDA llega a 1Hz (o la frecuencia que publiques).
             </div>
           </div>
         </div>
 
         <div style={chartColStyle}>
           <div style={cardStyle}>
-            <h3 style={sectionTitleStyle}>ECG (reconstruido desde chunks)</h3>
+            <h3 style={sectionTitleStyle}>ECG</h3>
             <div style={chartBoxStyle}>
               <ResponsiveContainer width="100%" height="100%">
                 <LineChart data={ecgSeries}>
                   <CartesianGrid strokeDasharray="3 3" />
                   <XAxis
                     dataKey="t"
+                    type="number"
+                    domain={[viewFrom, viewTo]}
+                    allowDataOverflow
                     tickFormatter={(v) => new Date(v).toLocaleTimeString()}
                     minTickGap={30}
                   />
                   <YAxis />
                   <Tooltip labelFormatter={(v) => new Date(v).toLocaleTimeString()} />
-                  <Line type="linear" dataKey="ecg" dot={false} />
+                  <Line type="linear" dataKey="ecg" dot={false} isAnimationActive={false} />
                 </LineChart>
               </ResponsiveContainer>
             </div>
-            <div style={hintStyle}>
-              ECG asume chunk = {CHUNK_MS}ms. Si envías 125 muestras ⇒ 250Hz.
+          </div>
+        </div>
+      </div>
+
+      <div style={timelineRowStyle}>
+        <div style={timelineCardStyle}>
+          <h3 style={sectionTitleStyle}>Timeline</h3>
+
+          <div style={timelineControlsStyle}>
+            <button style={smallBtnStyle} onClick={onLive} disabled={!items.length}>
+              Live
+            </button>
+
+            <div style={{ flex: "1 1 520px", minWidth: 260 }}>
+              <input
+                type="range"
+                min={sliderMin}
+                max={sliderMax}
+                value={clampViewTo(viewTo)}
+                onChange={onTimelineChange}
+                disabled={sliderDisabled || !items.length}
+                style={{ width: "100%" }}
+              />
+              <div style={hintStyle}>
+                Ventana: {DISPLAY_MS / 1000}s | Modo: <b>{followLive ? "live" : "manual"}</b> | Vista hasta:{" "}
+                <b>{new Date(clampViewTo(viewTo)).toLocaleTimeString()}</b>
+              </div>
             </div>
           </div>
+        </div>
+      </div>
+
+      <div style={{ ...shellStyle, marginTop: 16 }}>
+        <div style={cardStyle}>
+          <h3 style={sectionTitleStyle}>ECG Lead Off</h3>
+          <div style={{ fontSize: 18, fontWeight: 800 }}>
+            {latestLeadOff ? "Detectado (electrodos desconectados)" : "No detectado (OK)"}
+          </div>
+          <div style={hintStyle}>leadOff = {String(latestLeadOff)} (0 = OK, 1 = lead off)</div>
         </div>
       </div>
     </div>
