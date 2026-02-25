@@ -13,11 +13,12 @@ import { config } from "./amplifyConfig.js";
 
 const API = config.apiBaseUrl; // sin slash final
 
-const CHUNK_MS = 500;        // ESP manda un chunk cada 500ms
-const WINDOW_MS = 60_000;    // últimos 60s guardados en memoria
-const DISPLAY_MS = 5_000;    // ventana visible en el eje X (5s)
-const POLL_MS = 1000;        // refresco dashboard (1s)
-const CLOCK_MS = 250;        // refresco reloj UI
+const CHUNK_MS = 500;         // ESP manda un chunk cada 500ms
+const WINDOW_MS = 60_000;     // últimos 60s guardados en memoria
+const DISPLAY_MS_EDA = 60_000; // EDA visible: 60s
+const DISPLAY_MS_ECG = 5_000;  // ECG visible: 5s
+const POLL_MS = 1000;         // refresco dashboard (1s)
+const CLOCK_MS = 250;         // refresco reloj UI
 
 function decodeJwtPayload(token) {
   try {
@@ -50,6 +51,29 @@ async function apiPut(path, token, body) {
   return res.json();
 }
 
+function computeYDomain(points, key) {
+  if (!points || points.length < 2) return ["auto", "auto"];
+  let mn = Number.POSITIVE_INFINITY;
+  let mx = Number.NEGATIVE_INFINITY;
+
+  for (const p of points) {
+    const v = Number(p?.[key]);
+    if (!Number.isFinite(v)) continue;
+    if (v < mn) mn = v;
+    if (v > mx) mx = v;
+  }
+
+  if (!Number.isFinite(mn) || !Number.isFinite(mx)) return ["auto", "auto"];
+  if (mn === mx) {
+    const pad = Math.max(1e-6, Math.abs(mn) * 0.05);
+    return [mn - pad, mx + pad];
+  }
+
+  const span = mx - mn;
+  const pad = span * 0.08;
+  return [mn - pad, mx + pad];
+}
+
 export default function Dashboard({ user, signOut }) {
   const [token, setToken] = useState("");
   const [isAdmin, setIsAdmin] = useState(false);
@@ -64,9 +88,12 @@ export default function Dashboard({ user, signOut }) {
   // reloj actual (hora del navegador)
   const [nowMs, setNowMs] = useState(Date.now());
 
-  // ventana visible del gráfico (control tipo timeline)
-  const [followLive, setFollowLive] = useState(true);
-  const [viewTo, setViewTo] = useState(Date.now());
+  // Ventanas X independientes
+  const [followLiveEda, setFollowLiveEda] = useState(true);
+  const [viewToEda, setViewToEda] = useState(Date.now());
+
+  const [followLiveEcg, setFollowLiveEcg] = useState(true);
+  const [viewToEcg, setViewToEcg] = useState(Date.now());
 
   // ====== STYLES ======
   const pageStyle = {
@@ -216,18 +243,10 @@ export default function Dashboard({ user, signOut }) {
     boxShadow: "0 10px 30px rgba(0,0,0,0.10)",
   };
 
-  const timelineRowStyle = {
-    ...shellStyle,
-    marginTop: 14,
-    display: "flex",
-    gap: 12,
-    alignItems: "center",
-    flexWrap: "wrap",
-  };
-
   const timelineCardStyle = {
     ...cardStyle,
-    width: "100%",
+    marginTop: 10,
+    paddingTop: 12,
   };
 
   const timelineControlsStyle = {
@@ -403,54 +422,89 @@ export default function Dashboard({ user, signOut }) {
     return pts.filter((p) => p.t >= cutoff);
   }, [items]);
 
-  // Timeline bounds (usa ECG si hay; si no, usa EDA)
-  const timelineBounds = useMemo(() => {
-    const series = ecgSeries.length ? ecgSeries : edaSeries;
-    if (!series.length) {
+  // Bounds independientes por chart
+  const boundsEda = useMemo(() => {
+    if (!edaSeries.length) {
       const t = Date.now();
       return { min: t - WINDOW_MS, max: t };
     }
-    const min = Number(series[0]?.t || Date.now() - WINDOW_MS);
-    const max = Number(series[series.length - 1]?.t || Date.now());
-    return { min, max };
-  }, [ecgSeries, edaSeries]);
+    return { min: edaSeries[0].t, max: edaSeries[edaSeries.length - 1].t };
+  }, [edaSeries]);
 
-  // Auto-follow: si está en live, mueve la ventana al último timestamp recibido (o now)
-  useEffect(() => {
-    if (!followLive) return;
-    const anchor = latestTs || Date.now();
-    setViewTo(anchor);
-  }, [followLive, latestTs]);
+  const boundsEcg = useMemo(() => {
+    if (!ecgSeries.length) {
+      const t = Date.now();
+      return { min: t - WINDOW_MS, max: t };
+    }
+    return { min: ecgSeries[0].t, max: ecgSeries[ecgSeries.length - 1].t };
+  }, [ecgSeries]);
 
-  const viewFrom = useMemo(() => viewTo - DISPLAY_MS, [viewTo]);
+  const clampViewTo = (kind, v) => {
+    const isEda = kind === "eda";
+    const display = isEda ? DISPLAY_MS_EDA : DISPLAY_MS_ECG;
+    const b = isEda ? boundsEda : boundsEcg;
 
-  // Para mostrar slider usable: mínimo tiene que permitir una ventana de 5s
-  const sliderMin = useMemo(() => {
-    const m = timelineBounds.min + DISPLAY_MS;
-    return Number.isFinite(m) ? m : Date.now() - WINDOW_MS + DISPLAY_MS;
-  }, [timelineBounds.min]);
+    const max = Number.isFinite(b.max) ? b.max : Date.now();
+    const minAllowed = (Number.isFinite(b.min) ? b.min : Date.now() - WINDOW_MS) + display;
 
-  const sliderMax = useMemo(() => {
-    const m = timelineBounds.max;
-    return Number.isFinite(m) ? m : Date.now();
-  }, [timelineBounds.max]);
-
-  const sliderDisabled = useMemo(() => {
-    return sliderMax <= sliderMin;
-  }, [sliderMax, sliderMin]);
-
-  const clampViewTo = (v) => {
-    if (!Number.isFinite(v)) return sliderMax;
-    if (v < sliderMin) return sliderMin;
-    if (v > sliderMax) return sliderMax;
+    if (!Number.isFinite(v)) return max;
+    if (max <= minAllowed) return max; // no hay rango suficiente
+    if (v < minAllowed) return minAllowed;
+    if (v > max) return max;
     return v;
   };
 
-  // Si cambia el rango de datos (entra data nueva), evita que viewTo se quede fuera de bounds
+  // Auto-follow independiente
   useEffect(() => {
-    setViewTo((prev) => clampViewTo(prev));
+    if (!followLiveEda) return;
+    const anchor = latestTs || Date.now();
+    setViewToEda(clampViewTo("eda", anchor));
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sliderMin, sliderMax]);
+  }, [followLiveEda, latestTs, boundsEda.min, boundsEda.max]);
+
+  useEffect(() => {
+    if (!followLiveEcg) return;
+    const anchor = latestTs || Date.now();
+    setViewToEcg(clampViewTo("ecg", anchor));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [followLiveEcg, latestTs, boundsEcg.min, boundsEcg.max]);
+
+  const viewFromEda = useMemo(() => viewToEda - DISPLAY_MS_EDA, [viewToEda]);
+  const viewFromEcg = useMemo(() => viewToEcg - DISPLAY_MS_ECG, [viewToEcg]);
+
+  // slider ranges (min es b.min + display)
+  const sliderMinEda = useMemo(() => boundsEda.min + DISPLAY_MS_EDA, [boundsEda.min]);
+  const sliderMaxEda = useMemo(() => boundsEda.max, [boundsEda.max]);
+  const sliderDisabledEda = useMemo(() => sliderMaxEda <= sliderMinEda, [sliderMaxEda, sliderMinEda]);
+
+  const sliderMinEcg = useMemo(() => boundsEcg.min + DISPLAY_MS_ECG, [boundsEcg.min]);
+  const sliderMaxEcg = useMemo(() => boundsEcg.max, [boundsEcg.max]);
+  const sliderDisabledEcg = useMemo(() => sliderMaxEcg <= sliderMinEcg, [sliderMaxEcg, sliderMinEcg]);
+
+  // Evita que viewTo quede fuera al cambiar datos
+  useEffect(() => {
+    setViewToEda((prev) => clampViewTo("eda", prev));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sliderMinEda, sliderMaxEda]);
+
+  useEffect(() => {
+    setViewToEcg((prev) => clampViewTo("ecg", prev));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sliderMinEcg, sliderMaxEcg]);
+
+  // Data visible para auto-ajuste de Y
+  const edaVisible = useMemo(
+    () => edaSeries.filter((p) => p.t >= viewFromEda && p.t <= viewToEda),
+    [edaSeries, viewFromEda, viewToEda]
+  );
+
+  const ecgVisible = useMemo(
+    () => ecgSeries.filter((p) => p.t >= viewFromEcg && p.t <= viewToEcg),
+    [ecgSeries, viewFromEcg, viewToEcg]
+  );
+
+  const edaYDomain = useMemo(() => computeYDomain(edaVisible, "eda"), [edaVisible]);
+  const ecgYDomain = useMemo(() => computeYDomain(ecgVisible, "ecg"), [ecgVisible]);
 
   const onChangeDevice = (e) => {
     const dev = e.target.value;
@@ -460,8 +514,12 @@ export default function Dashboard({ user, signOut }) {
     setPatientIdInput(obj?.patient_id || "");
     setItems([]);
     setStatus("");
-    setFollowLive(true);
-    setViewTo(Date.now());
+
+    const t = Date.now();
+    setFollowLiveEda(true);
+    setFollowLiveEcg(true);
+    setViewToEda(t);
+    setViewToEcg(t);
   };
 
   const onSavePatientId = async () => {
@@ -487,16 +545,28 @@ export default function Dashboard({ user, signOut }) {
     }
   };
 
-  const onTimelineChange = (e) => {
-    const v = Number(e.target.value);
-    setFollowLive(false);
-    setViewTo(clampViewTo(v));
+  const onLiveEda = () => {
+    setFollowLiveEda(true);
+    const anchor = latestTs || Date.now();
+    setViewToEda(clampViewTo("eda", anchor));
   };
 
-  const onLive = () => {
-    setFollowLive(true);
+  const onLiveEcg = () => {
+    setFollowLiveEcg(true);
     const anchor = latestTs || Date.now();
-    setViewTo(clampViewTo(anchor));
+    setViewToEcg(clampViewTo("ecg", anchor));
+  };
+
+  const onTimelineChangeEda = (e) => {
+    const v = Number(e.target.value);
+    setFollowLiveEda(false);
+    setViewToEda(clampViewTo("eda", v));
+  };
+
+  const onTimelineChangeEcg = (e) => {
+    const v = Number(e.target.value);
+    setFollowLiveEcg(false);
+    setViewToEcg(clampViewTo("ecg", v));
   };
 
   const nowTimeStr = useMemo(() => new Date(nowMs).toLocaleTimeString(), [nowMs]);
@@ -595,9 +665,11 @@ export default function Dashboard({ user, signOut }) {
       ) : null}
 
       <div style={chartsRowStyle}>
+        {/* ====== EDA ====== */}
         <div style={chartColStyle}>
           <div style={cardStyle}>
             <h3 style={sectionTitleStyle}>EDA</h3>
+
             <div style={chartBoxStyle}>
               <ResponsiveContainer width="100%" height="100%">
                 <LineChart data={edaSeries}>
@@ -605,23 +677,50 @@ export default function Dashboard({ user, signOut }) {
                   <XAxis
                     dataKey="t"
                     type="number"
-                    domain={[viewFrom, viewTo]}
+                    domain={[viewFromEda, viewToEda]}
                     allowDataOverflow
                     tickFormatter={(v) => new Date(v).toLocaleTimeString()}
                     minTickGap={30}
                   />
-                  <YAxis />
+                  <YAxis domain={edaYDomain} />
                   <Tooltip labelFormatter={(v) => new Date(v).toLocaleTimeString()} />
                   <Line type="monotone" dataKey="eda" dot={false} isAnimationActive={false} />
                 </LineChart>
               </ResponsiveContainer>
             </div>
+
+            <div style={timelineCardStyle}>
+              <div style={timelineControlsStyle}>
+                <button style={smallBtnStyle} onClick={onLiveEda} disabled={!items.length}>
+                  Live
+                </button>
+
+                <div style={{ flex: "1 1 520px", minWidth: 260 }}>
+                  <input
+                    type="range"
+                    min={Number.isFinite(sliderMinEda) ? sliderMinEda : Date.now() - WINDOW_MS + DISPLAY_MS_EDA}
+                    max={Number.isFinite(sliderMaxEda) ? sliderMaxEda : Date.now()}
+                    value={clampViewTo("eda", viewToEda)}
+                    onChange={onTimelineChangeEda}
+                    disabled={sliderDisabledEda || !items.length}
+                    style={{ width: "100%" }}
+                  />
+                  <div style={hintStyle}>
+                    Ventana: {DISPLAY_MS_EDA / 1000}s | Modo: <b>{followLiveEda ? "live" : "manual"}</b> | Vista hasta:{" "}
+                    <b>{new Date(clampViewTo("eda", viewToEda)).toLocaleTimeString()}</b>
+                  </div>
+                </div>
+              </div>
+            </div>
+
           </div>
         </div>
 
+        {/* ====== ECG ====== */}
         <div style={chartColStyle}>
           <div style={cardStyle}>
             <h3 style={sectionTitleStyle}>ECG</h3>
+
             <div style={chartBoxStyle}>
               <ResponsiveContainer width="100%" height="100%">
                 <LineChart data={ecgSeries}>
@@ -629,45 +728,42 @@ export default function Dashboard({ user, signOut }) {
                   <XAxis
                     dataKey="t"
                     type="number"
-                    domain={[viewFrom, viewTo]}
+                    domain={[viewFromEcg, viewToEcg]}
                     allowDataOverflow
                     tickFormatter={(v) => new Date(v).toLocaleTimeString()}
                     minTickGap={30}
                   />
-                  <YAxis />
+                  <YAxis domain={ecgYDomain} />
                   <Tooltip labelFormatter={(v) => new Date(v).toLocaleTimeString()} />
                   <Line type="linear" dataKey="ecg" dot={false} isAnimationActive={false} />
                 </LineChart>
               </ResponsiveContainer>
             </div>
-          </div>
-        </div>
-      </div>
 
-      <div style={timelineRowStyle}>
-        <div style={timelineCardStyle}>
-          <h3 style={sectionTitleStyle}>Timeline</h3>
+            <div style={timelineCardStyle}>
+              <div style={timelineControlsStyle}>
+                <button style={smallBtnStyle} onClick={onLiveEcg} disabled={!items.length}>
+                  Live
+                </button>
 
-          <div style={timelineControlsStyle}>
-            <button style={smallBtnStyle} onClick={onLive} disabled={!items.length}>
-              Live
-            </button>
-
-            <div style={{ flex: "1 1 520px", minWidth: 260 }}>
-              <input
-                type="range"
-                min={sliderMin}
-                max={sliderMax}
-                value={clampViewTo(viewTo)}
-                onChange={onTimelineChange}
-                disabled={sliderDisabled || !items.length}
-                style={{ width: "100%" }}
-              />
-              <div style={hintStyle}>
-                Ventana: {DISPLAY_MS / 1000}s | Modo: <b>{followLive ? "live" : "manual"}</b> | Vista hasta:{" "}
-                <b>{new Date(clampViewTo(viewTo)).toLocaleTimeString()}</b>
+                <div style={{ flex: "1 1 520px", minWidth: 260 }}>
+                  <input
+                    type="range"
+                    min={Number.isFinite(sliderMinEcg) ? sliderMinEcg : Date.now() - WINDOW_MS + DISPLAY_MS_ECG}
+                    max={Number.isFinite(sliderMaxEcg) ? sliderMaxEcg : Date.now()}
+                    value={clampViewTo("ecg", viewToEcg)}
+                    onChange={onTimelineChangeEcg}
+                    disabled={sliderDisabledEcg || !items.length}
+                    style={{ width: "100%" }}
+                  />
+                  <div style={hintStyle}>
+                    Ventana: {DISPLAY_MS_ECG / 1000}s | Modo: <b>{followLiveEcg ? "live" : "manual"}</b> | Vista hasta:{" "}
+                    <b>{new Date(clampViewTo("ecg", viewToEcg)).toLocaleTimeString()}</b>
+                  </div>
+                </div>
               </div>
             </div>
+
           </div>
         </div>
       </div>
